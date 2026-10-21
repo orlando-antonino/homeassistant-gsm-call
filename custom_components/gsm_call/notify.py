@@ -173,6 +173,8 @@ class GsmCallNotificationService(GsmBaseNotificationService):
                 limit=READ_LIMIT,
             )
         )
+        if not await GsmBaseNotificationService.modem.wake_up():
+            raise HomeAssistantError(f"Modem on {self.device_path} is not responding to AT commands")
 
     async def terminate(self):
         """Terminate the modem connection for calls."""
@@ -242,6 +244,8 @@ class GsmSmsNotificationService(GsmBaseNotificationService):
                 limit=READ_LIMIT,
             )
         )
+        if not await GsmSmsNotificationService.modem.wake_up():
+            raise HomeAssistantError(f"Modem on {self.device_path} is not responding to AT commands")
 
     async def terminate(self):
         """Terminate the modem connection for SMS."""

@@ -24,6 +24,24 @@ class Modem:
         self.send_command(command, terminator)
         return await self._read_response(timeout, end_markers)
 
+    async def wake_up(self, attempts: int = 5, timeout: float = 2) -> bool:
+        # A sleeping modem may drop the first bytes it receives, so probe with plain AT until it answers
+        self.log_line_states()
+        for attempt in range(1, attempts + 1):
+            lines = await self.execute_at("AT", timeout=timeout, end_markers=["OK", "ERROR"])
+            if "OK" in lines:
+                return True
+            _LOGGER.warning(f"Modem did not answer AT (attempt {attempt}/{attempts}), got: {' '.join(lines)}")
+            self.log_line_states()
+        return False
+
+    def log_line_states(self) -> None:
+        try:
+            port = self.writer.transport.serial
+            _LOGGER.debug(f"Serial line states: CTS={port.cts} DSR={port.dsr} CD={port.cd} RI={port.ri}")
+        except Exception as e:
+            _LOGGER.debug(f"Unable to read serial line states: {e!r}")
+
     def send_command(self, command: str, terminator: str = DEFAULT_EOL) -> None:
         payload = f"{command}{terminator}".encode()
         _LOGGER.debug(f"Sending: {payload!r}")
