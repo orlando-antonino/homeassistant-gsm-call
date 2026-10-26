@@ -64,6 +64,23 @@ Note:
 
 Before the called phone starts ringing, there's typically a 5-10 second delay while the call connects. The integration will wait up to 20 seconds (default) for this connection to establish. This timeout can be adjusted by specifying `dial_timeout_sec`.
 
+### Keepalive
+
+Some modems stop responding to AT commands after a few days of inactivity. The integration can ping the modem with `AT` periodically, so a stuck modem is detected before you need it. Set the interval in minutes with `keepalive_interval_min` (disabled by default):
+
+```yaml
+notify:
+  - name: call
+    platform: gsm_call
+    device: /dev/serial/by-id/usb-HUAWEI_Technology_HUAWEI_Mobile-if01-port0
+    keepalive_interval_min: 30
+```
+
+Note:
+- A ping is skipped while a call or an SMS is in progress; calls and SMS started during a ping wait for it to finish.
+- With debug logs enabled, each ping logs the network registration (`AT+CREG?`), signal quality (`AT+CSQ`) and, on Huawei modems, `AT^SYSINFO`.
+- If the modem doesn't answer, the `gsm_call_modem_unresponsive` event is fired (see [Events](#events)).
+
 ## Events
 
 The integration fires the `gsm_call_ended` event indicating whether the call was declined or answered. For example, you can turn off the alarm if the callee declined a call:
@@ -85,6 +102,20 @@ automation:
 `reason` can contain the following values: `not_answered`, `declined`, `answered`.
 
 In addition to the `reason`, you can filter by the `phone_number`. All possible data properties can be found in [developer tools](https://my.home-assistant.io/create-link/?redirect=developer_events).
+
+When [keepalive](#keepalive) is enabled and the modem doesn't answer a ping, the integration fires the `gsm_call_modem_unresponsive` event with the modem path in `device`. You can use it to get notified or to power-cycle the modem:
+
+```yaml
+automation:
+  - alias: "Notify when the GSM modem is stuck"
+    triggers:
+      - trigger: event
+        event_type: gsm_call_modem_unresponsive
+    actions:
+      - action: persistent_notification.create
+        data:
+          message: "GSM modem {{ trigger.event.data.device }} is not responding"
+```
 
 ## SMS support
 

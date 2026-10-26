@@ -42,6 +42,10 @@ class Modem:
         except Exception as e:
             _LOGGER.debug(f"Unable to read serial line states: {e!r}")
 
+    async def close(self) -> None:
+        self.writer.close()
+        await self.writer.wait_closed()
+
     def send_command(self, command: str, terminator: str = DEFAULT_EOL) -> None:
         payload = f"{command}{terminator}".encode()
         _LOGGER.debug(f"Sending: {payload!r}")

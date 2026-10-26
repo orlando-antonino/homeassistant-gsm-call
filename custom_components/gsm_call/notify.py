@@ -4,7 +4,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import homeassistant.helpers.config_validation as cv
 import serial
@@ -17,6 +20,7 @@ from homeassistant.components.notify.legacy import BaseNotificationService
 from homeassistant.const import CONF_DEVICE
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from custom_components.gsm_call.sms.sms_sender import SmsSender
@@ -25,9 +29,11 @@ from .calls.at_dialer import ATDialer
 from .calls.at_tone_dialer import ATToneDialer
 from .calls.gtm382_dialer import GTM382Dialer
 from .calls.zte_dialer import ZTEDialer
-from .const import (_LOGGER, ATTR_PHONE_NUMBER, ATTR_REASON, CONF_AT_COMMAND,
-                    CONF_CALL_DURATION_SEC, CONF_DIAL_TIMEOUT_SEC,
-                    CONF_HARDWARE, CONF_TYPE, EVENT_GSM_CALL_ENDED,
+from .const import (_LOGGER, ATTR_DEVICE, ATTR_PHONE_NUMBER, ATTR_REASON,
+                    CONF_AT_COMMAND, CONF_CALL_DURATION_SEC,
+                    CONF_DIAL_TIMEOUT_SEC, CONF_HARDWARE,
+                    CONF_KEEPALIVE_INTERVAL_MIN, CONF_TYPE,
+                    EVENT_GSM_CALL_ENDED, EVENT_GSM_MODEM_UNRESPONSIVE,
                     GSM_7BIT_ALPHABET)
 from .modem import READ_LIMIT, Modem
 
@@ -46,21 +52,26 @@ PLATFORM_SCHEMA = NOTIFY_PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_HARDWARE, default="atd"): vol.In(SUPPORTED_DIALERS.keys()),
         vol.Optional(CONF_DIAL_TIMEOUT_SEC, default=20): cv.positive_int,
         vol.Optional(CONF_CALL_DURATION_SEC, default=30): cv.positive_int,
+        vol.Optional(CONF_KEEPALIVE_INTERVAL_MIN, default=0): cv.positive_int,
         # CONF_AT_COMMAND is replaced by CONF_HARDWARE
         vol.Optional(CONF_AT_COMMAND, default="ATD"): cv.matches_regex("^(ATD|ATDT)$"),
     }
 )
 
+# Calls, SMS and keepalive pings sharing a device must not open the serial port at the same time
+_PORT_LOCKS: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-def get_service(
-    _hass: HomeAssistant,
+
+async def async_get_service(
+    hass: HomeAssistant,
     config: ConfigType,
     _discovery_info: DiscoveryInfoType | None = None,
 ) -> BaseNotificationService:
     """Get the appropriate GSM notification service."""
+    service: GsmBaseNotificationService
     if config.get(CONF_TYPE, "call") == "sms":
         sender = SmsSender()
-        return GsmSmsNotificationService(config[CONF_DEVICE], sender)
+        service = GsmSmsNotificationService(config[CONF_DEVICE], sender)
     else:  # call
         dialer_name = config[CONF_HARDWARE]
 
@@ -72,7 +83,33 @@ def get_service(
             call_duration_sec=config[CONF_CALL_DURATION_SEC],
         )
 
-        return GsmCallNotificationService(config[CONF_DEVICE], dialer)
+        service = GsmCallNotificationService(config[CONF_DEVICE], dialer)
+
+    if interval_min := config[CONF_KEEPALIVE_INTERVAL_MIN]:
+        async_track_time_interval(
+            hass, service.async_keepalive, timedelta(minutes=interval_min), cancel_on_shutdown=True
+        )
+
+    return service
+
+
+async def _open_modem(device_path: str) -> Modem:
+    modem = Modem(
+        *await serial_asyncio.open_serial_connection(
+            url=device_path,
+            baudrate=75600,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            dsrdtr=True,
+            rtscts=True,
+            limit=READ_LIMIT,
+        )
+    )
+    if not await modem.wake_up():
+        await modem.close()
+        raise HomeAssistantError(f"Modem on {device_path} is not responding to AT commands")
+    return modem
 
 
 class GsmBaseNotificationService(BaseNotificationService):
@@ -120,6 +157,31 @@ class GsmBaseNotificationService(BaseNotificationService):
 
         return re.sub(r"\D", "", phone_number)
 
+    async def async_keepalive(self, _now: datetime) -> None:
+        """Ping the modem so it doesn't get stuck after long idle periods."""
+        lock = _PORT_LOCKS[self.device_path]
+        if lock.locked():
+            _LOGGER.debug("Modem is in use, skipping keepalive")
+            return
+
+        async with lock:
+            _LOGGER.debug(f"Connecting to {self.device_path} for keepalive...")
+            try:
+                modem = await _open_modem(self.device_path)
+            except (HomeAssistantError, OSError) as e:
+                _LOGGER.error(f"Keepalive failed: {e}")
+                self.hass.bus.async_fire(EVENT_GSM_MODEM_UNRESPONSIVE, {ATTR_DEVICE: self.device_path})
+                return
+
+            try:
+                states = []
+                for command in ("AT+CREG?", "AT+CSQ", "AT^SYSINFO"):
+                    lines = await modem.execute_at(command, timeout=2, end_markers=["OK", "ERROR", "+CME ERROR"])
+                    states.append(" ".join(line for line in lines if line not in (command, "OK")))
+                _LOGGER.debug(f"Keepalive OK, network state: {' | '.join(states)}")
+            finally:
+                await modem.close()
+
 
 class GsmCallNotificationService(GsmBaseNotificationService):
     """Service for making GSM voice calls."""
@@ -140,41 +202,29 @@ class GsmCallNotificationService(GsmBaseNotificationService):
             _LOGGER.info("Already making a voice call")
             return
 
-        try:
-            await self.connect()
+        async with _PORT_LOCKS[self.device_path]:
+            try:
+                await self.connect()
 
-            for target in targets:
-                try:
-                    phone_number = self._validate_phone_number(target)
-                except ValueError as e:
-                    _LOGGER.error(f"Invalid phone number {target}: {e}")
-                    continue
+                for target in targets:
+                    try:
+                        phone_number = self._validate_phone_number(target)
+                    except ValueError as e:
+                        _LOGGER.error(f"Invalid phone number {target}: {e}")
+                        continue
 
-                call_state = await self.dialer.dial(GsmBaseNotificationService.modem, phone_number)
-                self.hass.bus.async_fire(
-                    EVENT_GSM_CALL_ENDED,
-                    {ATTR_PHONE_NUMBER: phone_number, ATTR_REASON: call_state},
-                )
-        finally:
-            await self.terminate()
+                    call_state = await self.dialer.dial(GsmBaseNotificationService.modem, phone_number)
+                    self.hass.bus.async_fire(
+                        EVENT_GSM_CALL_ENDED,
+                        {ATTR_PHONE_NUMBER: phone_number, ATTR_REASON: call_state},
+                    )
+            finally:
+                await self.terminate()
 
     async def connect(self):
         """Connect to the modem for calls."""
         _LOGGER.debug(f"Connecting to {self.device_path} for voice call...")
-        GsmBaseNotificationService.modem = Modem(
-            *await serial_asyncio.open_serial_connection(
-                url=self.device_path,
-                baudrate=75600,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                dsrdtr=True,
-                rtscts=True,
-                limit=READ_LIMIT,
-            )
-        )
-        if not await GsmBaseNotificationService.modem.wake_up():
-            raise HomeAssistantError(f"Modem on {self.device_path} is not responding to AT commands")
+        GsmBaseNotificationService.modem = await _open_modem(self.device_path)
 
     async def terminate(self):
         """Terminate the modem connection for calls."""
@@ -182,8 +232,7 @@ class GsmCallNotificationService(GsmBaseNotificationService):
             return
 
         _LOGGER.debug("Closing connection to the modem after voice call...")
-        GsmBaseNotificationService.modem.writer.close()
-        await GsmBaseNotificationService.modem.writer.wait_closed()
+        await GsmBaseNotificationService.modem.close()
         GsmBaseNotificationService.modem = None
 
 
@@ -215,37 +264,25 @@ class GsmSmsNotificationService(GsmBaseNotificationService):
             _LOGGER.info("Already connected to the modem for SMS")
             return
 
-        try:
-            await self.connect()
+        async with _PORT_LOCKS[self.device_path]:
+            try:
+                await self.connect()
 
-            for target in targets:
-                try:
-                    phone_number = self._validate_phone_number(target)
-                except ValueError as e:
-                    _LOGGER.error(f"Invalid phone number {target}: {e}")
-                    continue
+                for target in targets:
+                    try:
+                        phone_number = self._validate_phone_number(target)
+                    except ValueError as e:
+                        _LOGGER.error(f"Invalid phone number {target}: {e}")
+                        continue
 
-                await self.sender.send(GsmSmsNotificationService.modem, phone_number, message)
-        finally:
-            await self.terminate()
+                    await self.sender.send(GsmSmsNotificationService.modem, phone_number, message)
+            finally:
+                await self.terminate()
 
     async def connect(self):
         """Connect to the modem for SMS."""
         _LOGGER.debug(f"Connecting to {self.device_path} for SMS...")
-        GsmSmsNotificationService.modem = Modem(
-            *await serial_asyncio.open_serial_connection(
-                url=self.device_path,
-                baudrate=75600,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                dsrdtr=True,
-                rtscts=True,
-                limit=READ_LIMIT,
-            )
-        )
-        if not await GsmSmsNotificationService.modem.wake_up():
-            raise HomeAssistantError(f"Modem on {self.device_path} is not responding to AT commands")
+        GsmSmsNotificationService.modem = await _open_modem(self.device_path)
 
     async def terminate(self):
         """Terminate the modem connection for SMS."""
@@ -253,6 +290,5 @@ class GsmSmsNotificationService(GsmBaseNotificationService):
             return
 
         _LOGGER.debug("Closing connection to the modem after SMS...")
-        GsmSmsNotificationService.modem.writer.close()
-        await GsmSmsNotificationService.modem.writer.wait_closed()
+        await GsmSmsNotificationService.modem.close()
         GsmSmsNotificationService.modem = None

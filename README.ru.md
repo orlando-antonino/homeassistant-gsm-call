@@ -64,6 +64,23 @@ notify:
 
 Обычно проходит от 5 до 10 секунд между началом набора номера и моментом, когда вызываемый телефон начинает звонить. По умолчанию, интеграция пытается установить соединение в течение 20 секунд. Это время можно изменить с помощью параметра `dial_timeout_sec`.
 
+### Проверка связи с модемом (keepalive)
+
+Некоторые модемы перестают отвечать на AT-команды после нескольких дней простоя. Интеграция может периодически отправлять модему команду `AT`, чтобы зависание обнаруживалось заранее, а не в момент звонка. Интервал в минутах задаётся параметром `keepalive_interval_min` (по умолчанию выключено):
+
+```yaml
+notify:
+  - name: call
+    platform: gsm_call
+    device: /dev/serial/by-id/usb-HUAWEI_Technology_HUAWEI_Mobile-if01-port0
+    keepalive_interval_min: 30
+```
+
+Примечания:
+- Проверка пропускается, если в этот момент идёт звонок или отправка СМС; звонки и СМС, начатые во время проверки, дожидаются её окончания.
+- При включённых отладочных логах каждая проверка записывает регистрацию в сети (`AT+CREG?`), уровень сигнала (`AT+CSQ`) и, для модемов Huawei, `AT^SYSINFO`.
+- Если модем не отвечает, публикуется событие `gsm_call_modem_unresponsive` (см. [События](#события)).
+
 ## Использование на практике
 
 Подробная статья по настройке охранной сигнализации с дозвоном: [Сигнализация в Home Assistant с функцией дозвона на телефон](https://mansmarthome.info/posts/okhrana-doma/sighnalizatsiia-v-home-assistant-s-funktsiiei-dozvona-na-tieliefon/?utm_source=github&utm_medium=referral&utm_campaign=gsm).
@@ -94,6 +111,20 @@ automation:
 - `answered` — абонент поднял трубку.
 
 Также помимо `reason` можно указать `phone_number` для фильтрации по номеру телефона. Все возможные свойства доступны в [панели разработчика](https://my.home-assistant.io/create-link/?redirect=developer_events).
+
+Если включена [проверка связи](#проверка-связи-с-модемом-keepalive) и модем не ответил, публикуется событие `gsm_call_modem_unresponsive` с путём к модему в `device`. Его можно использовать для уведомления или перезапуска модема:
+
+```yaml
+automation:
+  - alias: "Notify when the GSM modem is stuck"
+    triggers:
+      - trigger: event
+        event_type: gsm_call_modem_unresponsive
+    actions:
+      - action: persistent_notification.create
+        data:
+          message: "GSM modem {{ trigger.event.data.device }} is not responding"
+```
 
 ## Поддержка СМС
 

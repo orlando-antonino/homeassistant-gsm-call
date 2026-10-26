@@ -14,8 +14,11 @@ CONF_AT_COMMAND = "at_command"
 CONF_DIAL_TIMEOUT_SEC = "dial_timeout_sec"
 CONF_CALL_DURATION_SEC = "call_duration_sec"
 CONF_HARDWARE = "hardware"
+CONF_KEEPALIVE_INTERVAL_MIN = "keepalive_interval_min"
 
 EVENT_GSM_CALL_ENDED = f"{DOMAIN}_ended"
+EVENT_GSM_MODEM_UNRESPONSIVE = f"{DOMAIN}_modem_unresponsive"
+ATTR_DEVICE = "device"
 ATTR_PHONE_NUMBER = "phone_number"
 ATTR_REASON = "reason"
 

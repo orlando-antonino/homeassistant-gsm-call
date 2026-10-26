@@ -30,12 +30,15 @@ Version bumps are separate commits whose message is just the version, e.g. `1.0.
 
 All code is in `custom_components/gsm_call/`. `__init__.py` is empty and all wiring happens in `notify.py`.
 
-- **`notify.py`**: holds `PLATFORM_SCHEMA` and `get_service()`.
-  - `get_service()` returns `GsmSmsNotificationService` when `type: sms`, otherwise `GsmCallNotificationService`.
+- **`notify.py`**: holds `PLATFORM_SCHEMA` and `async_get_service()`.
+  - `async_get_service()` returns `GsmSmsNotificationService` when `type: sms`, otherwise `GsmCallNotificationService`.
   - The call service gets a dialer instance chosen from `SUPPORTED_DIALERS` by the `hardware` key.
   - `at_command` is deprecated: `hardware: atd` combined with `at_command: ATDT` maps to the `atdt` dialer.
   - Each `async_send_message` call opens its own serial connection and closes it in `finally`.
-  - The serial port settings (baud 75600, 8N1, `dsrdtr`/`rtscts`) are hardcoded in `connect()`.
+  - Opening goes through `_open_modem()`, which probes the modem with `AT` (`Modem.wake_up()`) and raises if it never answers.
+  - Calls, SMS and keepalive pings on the same device are serialized by a per-device lock in `_PORT_LOCKS`.
+  - `keepalive_interval_min` schedules `async_keepalive()`, which pings the modem, logs the network state and fires `gsm_call_modem_unresponsive` on failure. A ping is skipped if the port is busy.
+  - The serial port settings (baud 75600, 8N1, `dsrdtr`/`rtscts`) are hardcoded in `_open_modem()`.
   - The `modem` attribute is stored on the class, not the instance. It acts as a guard so a second call or SMS can't start while one is already in progress. `GsmCallNotificationService` uses `GsmBaseNotificationService.modem`, while `GsmSmsNotificationService` uses its own class attribute. Keep this in mind when changing concurrency behavior.
   - Phone numbers are validated as E.164, then stripped to digits. Dialers and the SMS sender add the `+` back themselves.
 - **`modem.py`**: `Modem` is a thin wrapper around an asyncio `StreamReader`/`StreamWriter`.
